@@ -1,0 +1,336 @@
+import cv2
+import numpy as np
+import time
+import os
+import sys
+
+# --- TWILIO CONFIGURATION (ACTION REQUIRED) ---
+# REPLACE these placeholders with your actual Twilio credentials and numbers.
+
+# >>>>>> START OF REQUIRED EDITS <<<<<<
+
+TWILIO_ACCOUNT_SID = "AC7f8f17565d3c3941fce394917d88cf4e" # <--- REPLACE WITH YOUR ACCOUNT SID
+TWILIO_AUTH_TOKEN = "82e86c75967cdde8f10ef1284703fac5"             # <--- REPLACE WITH YOUR AUTH TOKEN
+TWILIO_NUMBER = "+18782512835"                         # <--- REPLACE WITH YOUR TWILIO PHONE NUMBER (e.g., +1234567890)
+ALERT_RECIPIENT_NUMBER = "+919620825571"               # <--- REPLACE WITH THE RECIPIENT'S PHONE NUMBER
+
+# This URL must point to a TwiML Bin or XML file that tells Twilio what to say during the call.
+TWIML_URL = "https://handler.twilio.com/twiml/EHe721c990a7bf85ca680b840b747f3b00" 
+
+# >>>>>> END OF REQUIRED EDITS <<<<<<
+
+# Attempt to initialize Twilio Client (will run in simulation if fails)
+try:
+    from twilio.rest import Client
+    TWILIO_CLIENT = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    TWILIO_ACTIVE = True
+    print("Twilio Client initialized successfully.")
+except ImportError:
+    TWILIO_ACTIVE = False
+    print("WARNING: Twilio library not found. Alerts will be simulated.")
+except Exception as e:
+    TWILIO_ACTIVE = False
+    print(f"WARNING: Twilio initialization failed ({e}). Alerts will be simulated.")
+
+
+# --- Helper Function for C++'s system call ---
+# --- Combined Alert Function (Called when fall is confirmed) ---
+def send_alert(location_data):
+    """
+    Triggers both SMS and Call alerts using the Twilio API if active, otherwise simulates.
+    """
+    loc_x, loc_y = location_data
+    alert_message = f"URGENT: Fall detected! Location X:{loc_x}, Y:{loc_y}. Please call back immediately."
+    
+    print("\n" + "="*60)
+    print("!!! FALL DETECTED - TRIGGERING COMBINED ALERT !!!")
+    
+    if TWILIO_ACTIVE:
+        try:
+            # 1. Send SMS Alert
+            sms_message = TWILIO_CLIENT.messages.create(
+                to=ALERT_RECIPIENT_NUMBER,
+                from_=TWILIO_NUMBER,
+                body=alert_message
+            )
+            print(f"[TWILIO SMS SENT] SID: {sms_message.sid}")
+            
+            # 2. Make Voice Call Alert
+            call = TWILIO_CLIENT.calls.create(
+                to=ALERT_RECIPIENT_NUMBER,
+                from_=TWILIO_NUMBER,
+                url=TWIML_URL # Twilio fetches this URL for call instructions
+            )
+            print(f"[TWILIO CALL PLACED] SID: {call.sid}")
+
+        except Exception as e:
+            print(f"!!! CRITICAL ALERT FAILED (Twilio Error) !!! Error: {e}")
+            print("Please check your Twilio credentials, phone numbers, and TwiML URL.")
+    else:
+        # Simulation if Twilio is not initialized/installed
+        print("Alerts SIMULATED due to missing Twilio library or setup error:")
+        print(f"  > SMS to {ALERT_RECIPIENT_NUMBER}: {alert_message}")
+        print(f"  > CALL to {ALERT_RECIPIENT_NUMBER}: Voice call initiated using TwiML at {TWIML_URL}")
+        
+    print("="*60 + "\n")
+
+# --- FallDetector Class ---
+class FallDetector:
+    """Handles the core calculations for standard deviation, movement coefficient, 
+    position analysis, and fall confirmation/reset logic."""
+    def __init__(self):
+        # Global counter from C++ FallDetector.cpp, used to throttle email alerts
+        self.counter = 0
+
+    def get_stddev(self, data_list):
+        """Calculates the standard deviation of a list of data."""
+        if not data_list:
+            return 0.0
+        return np.std(data_list)
+
+    def get_movement_coefficient(self, foreground, history):
+        """Calculates the movement coefficient based on foreground (current frame) 
+        and history (Motion History Image)."""
+        sum_foreground = np.sum(foreground)
+        sum_history = np.sum(history)
+        
+        if sum_foreground == 0:
+            return 0.0
+            
+        # Original C++ logic: (sumHistory / sumForeground) * 100.0
+        return (sum_history / sum_foreground) * 100.0
+
+    def analyze_position(self, frame, theta_ratio, a_ratio, b_ratio, x_pos, y_pos, largest_contour):
+        """Analyzes the position, orientation, and size of the tracked object 
+        by fitting an ellipse and managing historical data lists."""
+        if not largest_contour.any():
+            return
+
+        # Draw Bounding Box
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        # Fit Ellipse (requires at least 5 points)
+        if len(largest_contour) > 5:
+            ellipse_data = cv2.fitEllipse(largest_contour)
+            center, axes, angle = ellipse_data
+            
+            # Draw ellipse
+            cv2.ellipse(frame, ellipse_data, (255, 0, 0), 2)
+
+            # Record ratios and positions
+            theta_ratio.append(angle)
+            a = max(axes) / 2.0  # long axis
+            b = min(axes) / 2.0  # short axis
+            a_ratio.append(a)
+            b_ratio.append(b)
+            x_pos.append(center[0])
+            y_pos.append(center[1])
+
+            # Manage history size (keep only the last 10 points/angles)
+            history_size = 10
+            for arr in [theta_ratio, a_ratio, b_ratio, x_pos, y_pos]:
+                if len(arr) > history_size:
+                    del arr[0]
+
+    def check_if_stays_in_place(self, start_time, x_pos, y_pos):
+        """Checks if the object remains still after a potential fall event."""
+        seconds_since_start = time.time() - start_time
+        x_dev_value = self.get_stddev(x_pos)
+        y_dev_value = self.get_stddev(y_pos)
+        
+        is_fall = False
+        is_checking = True
+        
+        location_data = (f"{np.mean(x_pos):.0f}", f"{np.mean(y_pos):.0f}") if x_pos else ("N/A", "N/A")
+
+        # Check for stillness (C++ logic: xDevValue < 2 and yDevValue < 2)
+        if x_dev_value < 2 and y_dev_value < 2:
+            is_fall = True
+            self.counter += 1
+            # Send alert after 6 consecutive still checks
+            if self.counter == self.max_counter:
+                send_alert(location_data=location_data)
+                self.counter = 0
+        else:
+            # Reset counter if movement is detected while checking for stillness
+            self.counter = 0
+
+        # Stop checking if enough time has passed (2 seconds) without confirming a fall
+        if not is_fall and seconds_since_start > 2:
+            is_checking = False
+            
+        return is_checking, is_fall
+
+    def check_movement_after_fall(self, x_pos, y_pos):
+        """Checks for significant movement to clear the 'fall' state."""
+        x_dev_value = self.get_stddev(x_pos)
+        y_dev_value = self.get_stddev(y_pos)
+
+        # print(f"X pos Std Dev: {x_dev_value:.2f}, Y pos Std Dev: {y_dev_value:.2f}")
+
+        # If significant movement is detected, reset the state
+        # C++ logic: if(xDevValue > 2 && yDevValue > 2)
+        if x_dev_value > 2 and y_dev_value > 2:
+            return False, False # to_be_checked=False, is_fall=False
+        else:
+            return True, True # is_fall=True, to_be_checked=True (keep state until movement)
+
+# --- FallChecker Class ---
+class FallChecker:
+    """Manages the video stream, background subtraction, contour processing, 
+    and drives the overall fall detection state machine."""
+    def __init__(self):
+        self.fall_detector = FallDetector()
+        
+        # History lists (equivalent to C++ vectors)
+        self.theta_ratio = []
+        self.a_ratio = []
+        self.b_ratio = []
+        self.x_pos = []
+        self.y_pos = []
+
+        # State variables
+        self.to_be_checked = False # Step a/b passed, checking for stillness (Step c)
+        self.is_fall = False       # Fall confirmed
+        self.start_time = 0        # Time marker for stillness check
+
+    def checker(self):
+        # List of indices to try: 0 (default USB), -1 (Raspberry Pi camera), 1 (second USB)
+        camera_indices = [0, -1, 1, 2] 
+        cap = None
+        
+        print("Attempting to open camera...")
+
+        # Try opening the camera with different indices and backends
+        for index in camera_indices:
+            # Try V4L2 backend (standard for Linux/Pi)
+            cap = cv2.VideoCapture(index + cv2.CAP_V4L2)
+            if cap.isOpened():
+                print(f"SUCCESS: Opened camera using index {index} and V4L2 backend.")
+                break
+            
+            # If V4L2 fails, try the default backend
+            cap = cv2.VideoCapture(index)
+            if cap.isOpened():
+                print(f"SUCCESS: Opened camera using index {index} and default backend.")
+                break
+
+        self.cap = cap
+        
+        # Final check if camera opened
+        if not cap or not cap.isOpened():
+            print("Error: Could not open camera after trying all common indices.")
+            print("Please check camera cable, power, and run 'v4l2-ctl --list-devices' in terminal.")
+            sys.exit(1)
+
+        pMOG2 = cv2.createBackgroundSubtractorMOG2()
+
+        ret, first_frame = cap.read()
+        if not ret:
+            print("Error: Could not read initial frame from camera.")
+            sys.exit(1)
+            
+        history = np.zeros(first_frame.shape[:2], np.float32)
+
+        print("--- Fall Detection System Running Headless (Twilio Enabled) ---")
+
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                print("---WAITING FOR CAMERA FRAME---")
+                continue
+
+            print(f"Loop running at {time.time():.2f}")
+
+            # --- Background Subtraction ---
+            pMOG2.setHistory(20)
+            pMOG2.setNMixtures(10)
+            pMOG2.setDetectShadows(False)
+            
+            fg_mask_mog2 = pMOG2.apply(frame)
+
+            # --- Contour Detection ---
+            contours, hierarchy = cv2.findContours(fg_mask_mog2, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+            largest_contour = np.array([])
+            if not self.to_be_checked:
+                largest_contour = np.array([]) 
+
+            max_area = 0.0
+
+            # Select the largest contour (the assumed person)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                # Filter by area (C++ logic: area > 500)
+                if area > max_area and area > 500:
+                    max_area = area
+                    largest_contour = contour
+
+            # --- Analyze Position ---
+            if largest_contour.any():
+                self.fall_detector.analyze_position(frame, self.theta_ratio, self.a_ratio, self.b_ratio, self.x_pos, self.y_pos, largest_contour)
+
+            # --- Motion History and Coefficient ---
+            timestamp = time.time()
+            cv2.motempl.updateMotionHistory(fg_mask_mog2, history, time.time(), 0.5)
+
+            movement_coefficient_value = self.fall_detector.get_movement_coefficient(fg_mask_mog2, history)
+            theta_ratio_value = self.fall_detector.get_stddev(self.theta_ratio)
+            a_ratio_value = self.fall_detector.get_stddev(self.a_ratio)
+            b_ratio_value = self.fall_detector.get_stddev(self.b_ratio)
+            
+            # --- Fall Detection Steps (State Machine) ---
+            
+            # 1. Check for rapid change (Potential Fall Signature)
+            if not self.to_be_checked:
+                # C++ logic: movementCoefficientValue > 80 and thetaRatioValue > 20 and (aRatioValue / bRatioValue) > 0.9
+                # Note: a/b ratio check ensures the object has changed shape/orientation rapidly
+                if (movement_coefficient_value > 80 and 
+                    theta_ratio_value > 20 and 
+                    (a_ratio_value / b_ratio_value) > 0.9):
+                    
+                    self.to_be_checked = True
+                    self.start_time = time.time() # Start the stillness timer
+
+            # 2. Check for stillness (Fall Confirmation)
+            if self.to_be_checked and not self.is_fall:
+                self.to_be_checked, self.is_fall = self.fall_detector.check_if_stays_in_place(
+                    self.start_time, self.x_pos, self.y_pos
+                )
+
+            # 3. Check for recovery/movement (Reset State)
+            if self.is_fall:
+                self.to_be_checked, self.is_fall = self.fall_detector.check_movement_after_fall(
+                    self.x_pos, self.y_pos
+                )
+
+            # --- Display Text and Windows ---
+            text = ""
+            if self.is_fall and self.to_be_checked:
+                text = "Fall"
+                color = (0, 0, 255) # Red for Fall
+            elif not self.is_fall and self.to_be_checked:
+                text = "Warning"
+                color = (0, 255, 255) # Yellow for Warning
+            else:
+                color = (255, 255, 255) # White for default
+
+            if text:
+                text_org = (10, frame.shape[0] - 15)
+                cv2.putText(frame, text, text_org, cv2.FONT_ITALIC, 1, color, 2, cv2.LINE_8)
+            #cv2.imshow("Original", frame)
+            #cv2.imshow("Mask", fg_mask_mog2)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        # --- Cleanup ---
+        cap.release()
+        #cv2.destroyAllWindows()
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    fall_checker = FallChecker()
+    fall_checker.checker()

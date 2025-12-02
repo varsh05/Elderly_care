@@ -1,0 +1,128 @@
+# elderly_robot.py
+
+# --- MODULE 1: Speech Recognition (STT) ---
+import speech_recognition as sr
+# --- MODULE 2: Language Model (LLM) ---
+from google import genai
+import os
+# --- MODULE 3: Text-to-Speech (TTS) ---
+from gtts import gTTS
+import pygame
+import time
+
+# --- INITIALIZATION ---
+try:
+    # Initialize Google Gemini Client (will use the GEMINI_API_KEY environment variable)
+    client = genai.Client()
+    # Initialize Pygame mixer for audio playback
+    pygame.mixer.init()
+    print("System Initialized: Gemini Client and Audio Mixer ready.")
+except Exception as e:
+    print(f"Initialization Error: {e}")
+    exit()
+
+# --- FUNCTION DEFINITIONS (Copied/Adapted from previous response) ---
+
+def speak_response(text):
+    """Converts text to speech using gTTS and plays the audio file."""
+    if not text: return
+    
+    filename = "robot_response.mp3"
+    try:
+        tts = gTTS(text=text, lang='en')
+        tts.save(filename)
+        
+        pygame.mixer.music.load(filename)
+        pygame.mixer.music.play()
+        
+        # Wait for the audio to finish playing
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+            
+    except Exception as e:
+        print(f"TTS/Audio Error: {e}")
+        
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
+
+def listen_for_command():
+    """Listens for a command and returns transcribed text."""
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        speak_response("I am listening.")
+        r.adjust_for_ambient_noise(source)
+        print("Robot Listening...")
+        try:
+            # Use a longer timeout and phrase limit for elderly users
+            audio = r.listen(source, timeout=8, phrase_time_limit=15) 
+        except sr.WaitTimeoutError:
+            print("No speech detected.")
+            return None
+        
+    try:
+        command = r.recognize_google(audio)
+        print(f"User said: {command}")
+        return command
+    except (sr.UnknownValueError, sr.RequestError) as e:
+        print(f"Speech Error: {e}")
+        return None
+
+def get_robot_response(user_input):
+    """Sends user text to Gemini API for a compassionate response."""
+    if not user_input:
+        return "I didn't quite catch that. Can you repeat it for me?"
+    
+    # System Instruction to define the robot's personality
+    system_instruction = (
+        "You are a compassionate, patient, and friendly elderly care assistant robot named 'Aura'."
+        "Your primary goal is to provide companionship, reminders, and simple information."
+        "Always respond with a warm, supportive, and clear tone. Keep answers concise."
+    )
+    
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash", 
+            contents=user_input,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_instruction
+            )
+        )
+        return response.text
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        return "I apologize, I'm having trouble connecting to the network right now."
+
+# --- MAIN EXECUTION LOOP ---
+
+def run_robot_loop():
+    speak_response("Hello, I am Aura, your friendly care assistant. I am ready to help.")
+    
+    while True:
+        # 1. STT: Listen for User Command
+        user_text = listen_for_command()
+        
+        if user_text:
+            if "stop" in user_text.lower() or "exit" in user_text.lower():
+                speak_response("Goodbye. I will be here when you need me.")
+                break
+
+            # 2. LLM: Get Robot Response
+            robot_reply = get_robot_response(user_text)
+            
+            # 3. TTS: Speak the Response
+            print(f"Robot: {robot_reply}")
+            speak_response(robot_reply)
+        
+        # Add a short pause before the next listening cycle
+        time.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        run_robot_loop()
+    except KeyboardInterrupt:
+        print("\nRobot process shut down by user.")
+    finally:
+        # Clean up pygame mixer upon exit
+        pygame.mixer.quit()
+

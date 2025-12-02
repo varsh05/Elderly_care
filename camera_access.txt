@@ -1,0 +1,174 @@
+import cv2
+import time
+from flask import Flask, Response, render_template
+
+try:
+    import fall_detection 
+    print("Successfully imported fall_detection module.")
+except ImportError:
+    # Define a dummy function for graceful failure if the file isn't set up yet
+    print("Warning: Could not find 'fall_detection.py' or 'process_frame'. Using passthrough.")
+    def process_frame(frame):
+        # If import fails, we just return the raw frame to keep the stream running
+        cv2.putText(frame, "FALL DETECTION MODULE MISSING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return frame
+
+# --- Configuration ---
+# Use 0 for the default camera (often the USB camera or CSI camera on RPi)
+CAMERA_INDEX = 0
+
+# --- Flask App Initialization ---
+app = Flask(__name__)
+
+# Try to open the camera (CV_CAP_V4L2 is often better for Linux/RPi)
+camera = cv2.VideoCapture(CAMERA_INDEX)
+
+if not camera.isOpened():
+    print(f"Error: Could not open camera with index {CAMERA_INDEX}.")
+    # Attempt a fallback to a different backend if the default fails
+    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW) # CAP_DSHOW is more for Windows, but sometimes needed.
+    if not camera.isOpened():
+        print("Fatal Error: Camera failed to open even with fallback.")
+        # We continue, but the stream will fail.
+    else:
+        print("Warning: Camera opened with an explicit backend hint.")
+else:
+    # Optional: Set resolution (adjust as needed for performance)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    print(f"Camera opened successfully. Resolution set to 640x480.")
+
+
+def generate_frames():
+    """
+    Core function to continuously capture frames from the camera, encode them
+    as JPEG, and yield them in a format suitable for motion JPEG streaming.
+    """
+    # Simple rate limiting in case the camera fails to open
+    if not camera.isOpened():
+        print("Camera is not available for streaming.")
+        return
+
+    while True:
+        # Read a new frame
+        success, frame = camera.read()
+        if not success:
+            print("Error: Failed to read frame from camera.")
+            time.sleep(1) # Wait a moment before retrying
+            continue
+
+        try:
+            # Encode the frame as JPEG
+            # This is critical for web streaming
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                print("Error: Failed to encode frame to JPEG.")
+                time.sleep(0.5)
+                continue
+
+            # Convert the buffer to bytes
+            frame_bytes = buffer.tobytes()
+
+            # Yield the frame in the Motion JPEG format
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+        except Exception as e:
+            print(f"An exception occurred during frame processing: {e}")
+            time.sleep(1)
+
+
+@app.route('/video_feed')
+def video_feed():
+    """
+    This route streams the camera feed using the Motion JPEG format.
+    The 'multipart/x-mixed-replace' content type is used for this continuous stream.
+    """
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/')
+def index():
+    """
+    The main route that serves the HTML page to display the stream.
+    The HTML is injected directly using a template string.
+    """
+    html_template = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Raspberry Pi Camera Stream</title>
+        <!-- Load Tailwind CSS for simple, clean styling -->
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script>
+            tailwind.config = {
+                theme: {
+                    extend: {
+                        fontFamily: {
+                            sans: ['Inter', 'sans-serif'],
+                        },
+                    }
+                }
+            }
+        </script>
+        <style>
+            /* Simple centering and card styling */
+            body {
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                background-color: #f3f4f6;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="bg-white p-6 md:p-10 rounded-xl shadow-2xl max-w-4xl w-full text-center">
+            <h1 class="text-3xl font-bold text-gray-800 mb-6">Live Camera Feed</h1>
+            <p class="text-sm text-gray-500 mb-6">
+                Streaming from the Raspberry Pi using Flask and OpenCV.
+            </p>
+
+            <!-- The core image tag that loads the continuous stream -->
+            <img 
+                src="{{ url_for('video_feed') }}" 
+                alt="Live Video Stream" 
+                class="rounded-lg shadow-lg border-4 border-indigo-500/50 w-full" 
+                onerror="this.onerror=null; this.src='https://placehold.co/640x480/EF4444/FFFFFF?text=Stream+Loading...';"
+            >
+            
+            <div class="mt-8 text-left p-4 bg-indigo-50 rounded-lg">
+                <h3 class="text-lg font-semibold text-indigo-700">Instructions</h3>
+                <p class="text-sm text-gray-700">
+                    If you see a placeholder image, ensure the 
+                    <code class="font-mono text-xs bg-gray-200 px-1 py-0.5 rounded">app.py</code> 
+                    script is running and the camera is properly connected and not in use by another application.
+                </p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    # For a minimal Flask app, we can use render_template_string if needed,
+    # but since we are not loading from a file, returning the HTML string is sufficient.
+    # However, since we need url_for, we simulate render_template_string
+    # using simple string replacement for the video_feed URL.
+    feed_url = '/video_feed'
+    return html_template.replace('{{ url_for(\'video_feed\') }}', feed_url)
+
+
+if __name__ == '__main__':
+    # Flask will be accessible on the Raspberry Pi's IP address
+    # port 5000 is the default. Setting debug=False is better for RPi.
+    # host='0.0.0.0' makes it accessible externally (from your laptop).
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False)
+    finally:
+        # Important: Release the camera resource when the application stops
+        if camera.isOpened():
+            camera.release()
+            print("\nCamera resource released.")
